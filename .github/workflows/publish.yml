@@ -1,0 +1,65 @@
+name: Rebuild site from daily agent data
+on:
+  schedule:
+    - cron: '20 15 * * 1-5'   # weekdays 8:20 AM PT, after the 7:45 agent run
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  DRIVE_FOLDER: 1IppAd0yN8fevDySo-Ju7RCbjyCCPOxEv
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch newest agent blob from Drive
+        run: |
+          set -e
+          curl -sL "https://drive.google.com/embeddedfolderview?id=${DRIVE_FOLDER}#list" -o folder.html
+          python3 - <<'PY'
+          import re
+          html = open('folder.html').read()
+          entries = re.findall(r'entry-([\w-]{20,})".*?flip-entry-title">([^<]+)<', html, re.S)
+          blobs = sorted((name, fid) for fid, name in entries
+                         if re.fullmatch(r'agentdata-\d{8}\.enc', name))
+          assert blobs, "no agentdata blobs found in Drive folder"
+          name, fid = blobs[-1]
+          print("newest blob:", name)
+          open('blob_id.txt', 'w').write(fid)
+          PY
+          curl -sL "https://drive.google.com/uc?export=download&id=$(cat blob_id.txt)" -o agentdata.enc.b64
+
+      - name: Rebuild encrypted site
+        env:
+          SITE_PASSWORD: ${{ secrets.SITE_PASSWORD }}
+        run: |
+          set -e
+          base64 -d agentdata.enc.b64 > agentdata.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:SITE_PASSWORD -in agentdata.enc -out agentdata.json
+          python3 -c "import json; json.load(open('agentdata.json'))"
+          npm i --no-fund --no-audit staticrypt@3
+          npx staticrypt index.html -p "$SITE_PASSWORD" --decrypt -d plain
+          grep -q 'id="agentData"' plain/index.html
+          python3 - <<'PY'
+          import re
+          shell = open('plain/index.html').read()
+          data = open('agentdata.json').read().strip()
+          new, n = re.subn(
+              r'(<script id="agentData" type="application/json">).*?(</script>)',
+              lambda m: m.group(1) + data + m.group(2), shell, count=1, flags=re.S)
+          assert n == 1, "agentData slot not found"
+          open('plain/index.html', 'w').write(new)
+          PY
+          npx staticrypt plain/index.html -p "$SITE_PASSWORD" -d built --remember 30 \
+            --template-title "Morning Brief" --template-instructions "Enter the dashboard password"
+          ! grep -q 'id="agentData"' built/index.html
+          mv built/index.html index.html
+          rm -rf plain built agentdata* blob_id.txt folder.html node_modules package.json package-lock.json
+
+      - name: Commit if changed
+        run: |
+          git config user.name "morning-brief-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add index.html
+          git diff --cached --quiet || (git commit -m "Site rebuild $(date -u +%F)" && git push)
