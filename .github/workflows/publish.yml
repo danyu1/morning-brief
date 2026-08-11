@@ -22,7 +22,9 @@ jobs:
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
           ok=""
           if [ -n "${DRIVE_API_KEY}" ]; then
-            curl -sf "https://www.googleapis.com/drive/v3/files?q=%27${DRIVE_FOLDER}%27+in+parents&fields=files(id,name)&key=${DRIVE_API_KEY}" -o list.json && ok=api || true
+            for i in 1 2 3; do
+              curl -sf "https://www.googleapis.com/drive/v3/files?q=%27${DRIVE_FOLDER}%27+in+parents&fields=files(id,name)&key=${DRIVE_API_KEY}" -o list.json && { ok=api; break; } || sleep $((i*10))
+            done
           fi
           if [ -z "$ok" ]; then
             for i in 1 2 3 4; do
@@ -32,7 +34,8 @@ jobs:
               sleep $((i*15))
             done
           fi
-          [ -n "$ok" ] || { echo "::error::Drive folder listing unreachable from runner (all retries blocked)"; head -c 300 folder.html || true; exit 1; }
+          [ -n "$ok" ] || { echo "::error::Drive listing unreachable (API and scrape both failed)"; exit 1; }
+          echo "listing mode: $ok"
           python3 - "$ok" <<'PY'
           import re, sys, json
           mode = sys.argv[1]
@@ -49,10 +52,16 @@ jobs:
           print("newest blob:", blobs[-1][0])
           open("blob_id.txt", "w").write(blobs[-1][1])
           PY
-          for i in 1 2 3; do
-            curl -sL -A "$UA" "https://drive.google.com/uc?export=download&id=$(cat blob_id.txt)" -o agentdata.enc.b64
-            grep -q "U2FsdGVk" agentdata.enc.b64 && break || sleep $((i*10))
-          done
+          if [ "$ok" = "api" ]; then
+            for i in 1 2 3; do
+              curl -sfL "https://www.googleapis.com/drive/v3/files/$(cat blob_id.txt)?alt=media&key=${DRIVE_API_KEY}" -o agentdata.enc.b64 && break || sleep $((i*10))
+            done
+          else
+            for i in 1 2 3; do
+              curl -sL -A "$UA" "https://drive.google.com/uc?export=download&id=$(cat blob_id.txt)" -o agentdata.enc.b64
+              grep -q "U2FsdGVk" agentdata.enc.b64 && break || sleep $((i*10))
+            done
+          fi
           grep -q "U2FsdGVk" agentdata.enc.b64
 
       - name: Rebuild encrypted site
