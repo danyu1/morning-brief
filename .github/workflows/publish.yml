@@ -11,29 +11,51 @@ env:
 jobs:
   rebuild:
     runs-on: ubuntu-latest
+    env:
+      DRIVE_API_KEY: ${{ secrets.DRIVE_API_KEY }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Fetch newest agent blob from Drive
         run: |
           set -e
-          curl -sL "https://drive.google.com/embeddedfolderview?id=${DRIVE_FOLDER}#list" -o folder.html
-          python3 - <<'PY'
-          import re
-          html = open('folder.html').read()
-          entries = re.findall(r'entry-([\w-]{20,})".*?flip-entry-title">([^<]+)<', html, re.S)
-          blobs = sorted((name, fid) for fid, name in entries
-                         if re.fullmatch(r'agentdata-\d{8}\.enc', name))
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+          ok=""
+          if [ -n "${DRIVE_API_KEY}" ]; then
+            curl -sf "https://www.googleapis.com/drive/v3/files?q=%27${DRIVE_FOLDER}%27+in+parents&fields=files(id,name)&key=${DRIVE_API_KEY}" -o list.json && ok=api || true
+          fi
+          if [ -z "$ok" ]; then
+            for i in 1 2 3 4; do
+              curl -sL -A "$UA" "https://drive.google.com/embeddedfolderview?id=${DRIVE_FOLDER}#list" -o folder.html || true
+              if grep -q "flip-entry" folder.html; then ok=scrape; break; fi
+              echo "listing attempt $i got blocked; retrying in $((i*15))s"
+              sleep $((i*15))
+            done
+          fi
+          [ -n "$ok" ] || { echo "::error::Drive folder listing unreachable from runner (all retries blocked)"; head -c 300 folder.html || true; exit 1; }
+          python3 - "$ok" <<'PY'
+          import re, sys, json
+          mode = sys.argv[1]
+          if mode == "api":
+              files = json.load(open("list.json")).get("files", [])
+              blobs = sorted((f["name"], f["id"]) for f in files
+                             if re.fullmatch(r"agentdata-\d{8}\.enc", f["name"]))
+          else:
+              html = open("folder.html").read()
+              entries = re.findall(r'entry-([\w-]{20,})".*?flip-entry-title">([^<]+)<', html, re.S)
+              blobs = sorted((n, f) for f, n in entries
+                             if re.fullmatch(r"agentdata-\d{8}\.enc", n))
           assert blobs, "no agentdata blobs found in Drive folder"
-          name, fid = blobs[-1]
-          print("newest blob:", name)
-          open('blob_id.txt', 'w').write(fid)
+          print("newest blob:", blobs[-1][0])
+          open("blob_id.txt", "w").write(blobs[-1][1])
           PY
-          curl -sL "https://drive.google.com/uc?export=download&id=$(cat blob_id.txt)" -o agentdata.enc.b64
+          for i in 1 2 3; do
+            curl -sL -A "$UA" "https://drive.google.com/uc?export=download&id=$(cat blob_id.txt)" -o agentdata.enc.b64
+            grep -q "U2FsdGVk" agentdata.enc.b64 && break || sleep $((i*10))
+          done
+          grep -q "U2FsdGVk" agentdata.enc.b64
 
       - name: Rebuild encrypted site
-        env:
-          SITE_PASSWORD: ${{ secrets.SITE_PASSWORD }}
         run: |
           set -e
           base64 -d agentdata.enc.b64 > agentdata.enc
@@ -65,7 +87,9 @@ jobs:
               open('built/index.html', 'w').write(w)
           PY
           mv built/index.html index.html
-          rm -rf plain built agentdata* blob_id.txt folder.html node_modules package.json package-lock.json
+          rm -rf plain built agentdata* blob_id.txt folder.html list.json node_modules package.json package-lock.json
+        env:
+          SITE_PASSWORD: ${{ secrets.SITE_PASSWORD }}
 
       - name: Commit if changed
         run: |
