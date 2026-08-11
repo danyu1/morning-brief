@@ -1,7 +1,8 @@
 name: Rebuild site from daily agent data
 on:
   schedule:
-    - cron: '20 15 * * 1-5'   # weekdays 8:20 AM PT, after the 7:45 agent run
+    - cron: '20 15 * * 1-5'   # weekdays 8:20 AM PT — catches fast agent runs
+    - cron: '20 16 * * 1-5'   # weekdays 9:20 AM PT — catches slow agent runs
   workflow_dispatch:
 permissions:
   contents: write
@@ -54,6 +55,15 @@ jobs:
           npx staticrypt plain/index.html -p "$SITE_PASSWORD" -d built --remember 30 \
             --template-title "Morning Brief" --template-instructions "Enter the dashboard password"
           ! grep -q 'id="agentData"' built/index.html
+          python3 - <<'PY'
+          import re
+          shell = open('plain/index.html').read()
+          w = open('built/index.html').read()
+          m = re.search(r'<link rel="icon" type="image/svg\+xml" href="data:image/svg\+xml,[^"]*">', shell)
+          if m and '</title>' in w:
+              w = w.replace('</title>', '</title>' + m.group(0), 1)
+              open('built/index.html', 'w').write(w)
+          PY
           mv built/index.html index.html
           rm -rf plain built agentdata* blob_id.txt folder.html node_modules package.json package-lock.json
 
