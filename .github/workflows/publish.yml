@@ -11,57 +11,42 @@ env:
 jobs:
   rebuild:
     runs-on: ubuntu-latest
-    env:
-      DRIVE_API_KEY: ${{ secrets.DRIVE_API_KEY }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Fetch newest agent blob from Drive
+        env:
+          GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
         run: |
           set -e
-          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-          ok=""
-          if [ -n "${DRIVE_API_KEY}" ]; then
-            for i in 1 2 3; do
-              curl -sf "https://www.googleapis.com/drive/v3/files?q=%27${DRIVE_FOLDER}%27+in+parents&fields=files(id,name)&key=${DRIVE_API_KEY}" -o list.json && { ok=api; break; } || sleep $((i*10))
-            done
-          fi
-          if [ -z "$ok" ]; then
-            for i in 1 2 3 4; do
-              curl -sL -A "$UA" "https://drive.google.com/embeddedfolderview?id=${DRIVE_FOLDER}#list" -o folder.html || true
-              if grep -q "flip-entry" folder.html; then ok=scrape; break; fi
-              echo "listing attempt $i got blocked; retrying in $((i*15))s"
-              sleep $((i*15))
-            done
-          fi
-          [ -n "$ok" ] || { echo "::error::Drive listing unreachable (API and scrape both failed)"; exit 1; }
-          echo "listing mode: $ok"
-          python3 - "$ok" <<'PY'
-          import re, sys, json
-          mode = sys.argv[1]
-          if mode == "api":
-              files = json.load(open("list.json")).get("files", [])
-              blobs = sorted((f["name"], f["id"]) for f in files
-                             if re.fullmatch(r"agentdata-\d{8}\.enc", f["name"]))
-          else:
-              html = open("folder.html").read()
-              entries = re.findall(r'entry-([\w-]{20,})".*?flip-entry-title">([^<]+)<', html, re.S)
-              blobs = sorted((n, f) for f, n in entries
-                             if re.fullmatch(r"agentdata-\d{8}\.enc", n))
-          assert blobs, "no agentdata blobs found in Drive folder"
-          print("newest blob:", blobs[-1][0])
-          open("blob_id.txt", "w").write(blobs[-1][1])
+          pip -q install google-auth requests >/dev/null
+          python3 - <<'PY'
+          import os, json, re, requests
+          from google.oauth2 import service_account
+          import google.auth.transport.requests as gtr
+          folder = os.environ['DRIVE_FOLDER']
+          info = json.loads(os.environ['GDRIVE_SA_KEY'])
+          creds = service_account.Credentials.from_service_account_info(
+              info, scopes=['https://www.googleapis.com/auth/drive.readonly'])
+          creds.refresh(gtr.Request())
+          h = {'Authorization': 'Bearer ' + creds.token}
+          r = requests.get('https://www.googleapis.com/drive/v3/files',
+                           params={'q': f"'{folder}' in parents and trashed=false",
+                                   'fields': 'files(id,name)', 'pageSize': '1000'},
+                           headers=h, timeout=30)
+          r.raise_for_status()
+          files = r.json().get('files', [])
+          blobs = sorted((f['name'], f['id']) for f in files
+                         if re.fullmatch(r'agentdata-\d{8}\.enc', f['name']))
+          assert blobs, (f"no agentdata blobs visible to the service account "
+                         f"(saw {len(files)} files) — is the folder shared with the SA email?")
+          name, fid = blobs[-1]
+          print('newest blob:', name)
+          d = requests.get(f'https://www.googleapis.com/drive/v3/files/{fid}',
+                           params={'alt': 'media'}, headers=h, timeout=30)
+          d.raise_for_status()
+          open('agentdata.enc.b64', 'wb').write(d.content)
           PY
-          if [ "$ok" = "api" ]; then
-            for i in 1 2 3; do
-              curl -sfL "https://www.googleapis.com/drive/v3/files/$(cat blob_id.txt)?alt=media&key=${DRIVE_API_KEY}" -o agentdata.enc.b64 && break || sleep $((i*10))
-            done
-          else
-            for i in 1 2 3; do
-              curl -sL -A "$UA" "https://drive.google.com/uc?export=download&id=$(cat blob_id.txt)" -o agentdata.enc.b64
-              grep -q "U2FsdGVk" agentdata.enc.b64 && break || sleep $((i*10))
-            done
-          fi
           grep -q "U2FsdGVk" agentdata.enc.b64
 
       - name: Rebuild encrypted site
@@ -96,7 +81,7 @@ jobs:
               open('built/index.html', 'w').write(w)
           PY
           mv built/index.html index.html
-          rm -rf plain built agentdata* blob_id.txt folder.html list.json node_modules package.json package-lock.json
+          rm -rf plain built agentdata* node_modules package.json package-lock.json
         env:
           SITE_PASSWORD: ${{ secrets.SITE_PASSWORD }}
 
