@@ -1,8 +1,7 @@
 name: Rebuild site from daily agent data
 on:
   schedule:
-    - cron: '20 15 * * 1-5'   # weekdays 8:20 AM PT — catches fast agent runs
-    - cron: '20 16 * * 1-5'   # weekdays 9:20 AM PT — catches slow agent runs
+    - cron: '25 15-20 * * 1-5'   # weekdays hourly 8:25 AM – 1:25 PM PT
   workflow_dispatch:
 permissions:
   contents: write
@@ -36,11 +35,16 @@ jobs:
                            headers=h, timeout=30)
           r.raise_for_status()
           files = r.json().get('files', [])
-          blobs = sorted((f['name'], f['id']) for f in files
-                         if re.fullmatch(r'agentdata-\d{8}\.enc', f['name']))
+          pat = re.compile(r'agentdata-(\d{8})(?:-(\d{4}))?\.enc')
+          blobs = []
+          for f in files:
+              m = pat.fullmatch(f['name'])
+              if m:
+                  blobs.append(((m.group(1), m.group(2) or '0000'), f['name'], f['id']))
+          blobs.sort()
           assert blobs, (f"no agentdata blobs visible to the service account "
                          f"(saw {len(files)} files) — is the folder shared with the SA email?")
-          name, fid = blobs[-1]
+          key, name, fid = blobs[-1]
           print('newest blob:', name)
           d = requests.get(f'https://www.googleapis.com/drive/v3/files/{fid}',
                            params={'alt': 'media'}, headers=h, timeout=30)
